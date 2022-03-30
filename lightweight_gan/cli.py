@@ -6,7 +6,7 @@ from tqdm import tqdm
 from datetime import datetime
 from functools import wraps
 from lightweight_gan import Trainer, NanException
-from lightweight_gan.diff_augment_test import DiffAugmentTest
+from diff_augment_test import DiffAugmentTest
 
 import torch
 import torch.multiprocessing as mp
@@ -116,6 +116,7 @@ def train_from_folder(
     seed = 42,
     amp = False,
     show_progress = False,
+    wandb = False,
 ):
     num_image_tiles = default(num_image_tiles, 4 if image_size > 512 else 8)
 
@@ -146,7 +147,8 @@ def train_from_folder(
         calculate_fid_every = calculate_fid_every,
         calculate_fid_num_images = calculate_fid_num_images,
         clear_fid_cache = clear_fid_cache,
-        amp = amp
+        amp = amp,
+        wandb = wandb,
     )
 
     if generate:
@@ -188,3 +190,6 @@ def train_from_folder(
 
 def main():
     fire.Fire(train_from_folder)
+
+if __name__ == "__main__":
+    main()

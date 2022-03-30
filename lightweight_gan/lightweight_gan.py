@@ -24,13 +24,15 @@ import torchvision
 from torchvision import transforms
 from kornia.filters import filter2d
 
-from lightweight_gan.diff_augment import DiffAugment
-from lightweight_gan.version import __version__
+from diff_augment import DiffAugment
+# from lightweight_gan.version import __version__
 
 from tqdm import tqdm
 from einops import rearrange, reduce, repeat
 
-from adabelief_pytorch import AdaBelief
+# from adabelief_pytorch import AdaBelief
+
+from datasets import load_dataset
 
 # asserts
 
@@ -807,9 +809,9 @@ class LightweightGAN(nn.Module):
         if optimizer == "adam":
             self.G_opt = Adam(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
             self.D_opt = Adam(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
-        elif optimizer == "adabelief":
-            self.G_opt = AdaBelief(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
-            self.D_opt = AdaBelief(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
+        # elif optimizer == "adabelief":
+        #     self.G_opt = AdaBelief(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
+        #     self.D_opt = AdaBelief(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
         else:
             assert False, "No valid optimizer is given"
 
@@ -882,6 +884,7 @@ class Trainer():
         world_size = 1,
         log = False,
         amp = False,
+        wandb = False,
         *args,
         **kwargs
     ):
@@ -963,6 +966,14 @@ class Trainer():
         self.G_scaler = GradScaler(enabled = self.amp)
         self.D_scaler = GradScaler(enabled = self.amp)
 
+        self.wandb = wandb
+
+        # set up Weights and Biases if requested
+        if self.is_main and self.wandb:
+            import wandb
+
+            wandb.init(project=str(self.results_dir).split("/")[-1])  
+
     @property
     def image_extension(self):
         return 'jpg' if not self.transparent else 'png'
@@ -1015,7 +1026,7 @@ class Trainer():
 
             self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
             self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
-            self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+            self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs) 
 
     def write_config(self):
         self.config_path.write_text(json.dumps(self.config()))
@@ -1047,14 +1058,54 @@ class Trainer():
         }
 
     def set_data_src(self, folder):
-        num_workers = default(self.num_workers, math.ceil(NUM_CORES / self.world_size))
-        self.dataset = ImageDataset(folder, self.image_size, transparent = self.transparent, greyscale = self.greyscale, aug_prob = self.dataset_aug_prob)
-        sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
-        dataloader = DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        # start of using HuggingFace dataset
+        dataset = load_dataset("huggan/CelebA-faces")
+
+        if self.transparent:
+            num_channels = 4
+            pillow_mode = 'RGBA'
+            expand_fn = expand_greyscale(self.transparent)
+        elif self.greyscale:
+            num_channels = 1
+            pillow_mode = 'L'
+            expand_fn = identity()
+        else:
+            num_channels = 3
+            pillow_mode = 'RGB'
+            expand_fn = expand_greyscale(self.transparent)
+
+        convert_image_fn = partial(convert_image_to, pillow_mode)
+        
+        transform = transforms.Compose([
+            transforms.Lambda(convert_image_fn),
+            transforms.Lambda(partial(resize_to_minimum_size, self.image_size)),
+            transforms.Resize(self.image_size),
+            RandomApply(0., transforms.RandomResizedCrop(self.image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(self.image_size)),
+            transforms.ToTensor(),
+            transforms.Lambda(expand_fn)
+        ])
+
+        def transform_images(examples):
+            transformed_images = [transform(image.convert("RGB")) for image in examples["image"]]
+
+            examples["image"] = torch.stack(transformed_images)
+  
+            return examples
+
+        transformed_dataset = dataset.with_transform(transform_images)
+        
+        dataloader = DataLoader(transformed_dataset["train"], batch_size = self.batch_size, shuffle = True, drop_last = True, pin_memory = True)
+        num_samples = len(transformed_dataset)
+        ## end of HuggingFace dataset
+
+        # num_workers = default(self.num_workers, math.ceil(NUM_CORES / self.world_size))
+        # self.dataset = ImageDataset(folder, self.image_size, transparent = self.transparent, greyscale = self.greyscale, aug_prob = self.dataset_aug_prob)
+        # sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
+        # dataloader = DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
         self.loader = cycle(dataloader)
 
         # auto set augmentation prob for user if dataset is detected to be low
-        num_samples = len(self.dataset)
+        # num_samples = len(self.dataset)
         if not exists(self.aug_prob) and num_samples < 1e5:
             self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
@@ -1101,7 +1152,7 @@ class Trainer():
         self.GAN.D_opt.zero_grad()
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, G]):
             latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
-            image_batch = next(self.loader).cuda(self.rank)
+            image_batch = next(self.loader)["image"].cuda(self.rank)
             image_batch.requires_grad_()
 
             with amp_context():
@@ -1172,7 +1223,7 @@ class Trainer():
             latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
 
             if G_requires_calc_real:
-                image_batch = next(self.loader).cuda(self.rank)
+                image_batch = next(self.loader)["image"].cuda(self.rank)
                 image_batch.requires_grad_()
 
             with amp_context():
@@ -1335,7 +1386,7 @@ class Trainer():
             os.makedirs(real_path)
 
             for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-                real_batch = next(self.loader)
+                real_batch = next(self.loader)["image"]
                 for k, image in enumerate(real_batch.unbind(0)):
                     ind = k + batch_num * self.batch_size
                     torchvision.utils.save_image(image, real_path / f'{ind}.png')
@@ -1419,6 +1470,12 @@ class Trainer():
         log = ' | '.join(map(lambda n: f'{n[0]}: {n[1]:.2f}', data))
         print(log)
 
+        if self.is_main and self.wandb:
+            import wandb
+
+            log_dict = {v[0]:v[1] for v in data} 
+            wandb.log(log_dict)
+
     def model_name(self, num):
         return str(self.models_dir / self.name / f'model_{num}.pt')
 
@@ -1436,7 +1493,7 @@ class Trainer():
     def save(self, num):
         save_data = {
             'GAN': self.GAN.state_dict(),
-            'version': __version__,
+            # 'version': __version__,
             'G_scaler': self.G_scaler.state_dict(),
             'D_scaler': self.D_scaler.state_dict()
         }
