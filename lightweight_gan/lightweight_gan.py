@@ -24,13 +24,17 @@ import torchvision
 from torchvision import transforms
 from kornia.filters import filter2d
 
-from lightweight_gan.diff_augment import DiffAugment
-from lightweight_gan.version import __version__
+from diff_augment import DiffAugment
+# from lightweight_gan.version import __version__
 
 from tqdm import tqdm
 from einops import rearrange, reduce, repeat
 
-from adabelief_pytorch import AdaBelief
+# from adabelief_pytorch import AdaBelief
+
+from datasets import load_dataset
+
+from accelerate import Accelerator, DistributedDataParallelKwargs
 
 # asserts
 
@@ -807,16 +811,16 @@ class LightweightGAN(nn.Module):
         if optimizer == "adam":
             self.G_opt = Adam(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
             self.D_opt = Adam(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
-        elif optimizer == "adabelief":
-            self.G_opt = AdaBelief(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
-            self.D_opt = AdaBelief(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
+        # elif optimizer == "adabelief":
+        #     self.G_opt = AdaBelief(self.G.parameters(), lr = lr, betas=(0.5, 0.9))
+        #     self.D_opt = AdaBelief(self.D.parameters(), lr = lr * ttur_mult, betas=(0.5, 0.9))
         else:
             assert False, "No valid optimizer is given"
 
         self.apply(self._init_weights)
         self.reset_parameter_averaging()
 
-        self.cuda(rank)
+        # self.cuda(rank)
         self.D_aug = AugWrapper(self.D, image_size)
 
     def _init_weights(self, m):
@@ -882,6 +886,7 @@ class Trainer():
         world_size = 1,
         log = False,
         amp = False,
+        wandb = False,
         *args,
         **kwargs
     ):
@@ -957,11 +962,14 @@ class Trainer():
         self.rank = rank
         self.world_size = world_size
 
-        self.syncbatchnorm = is_ddp
+        # self.syncbatchnorm = is_ddp
+        self.syncbatchnorm = False
 
         self.amp = amp
         self.G_scaler = GradScaler(enabled = self.amp)
         self.D_scaler = GradScaler(enabled = self.amp)
+
+        self.wandb = wandb
 
     @property
     def image_extension(self):
@@ -985,11 +993,11 @@ class Trainer():
         # handle bugs when
         # switching from multi-gpu back to single gpu
 
-        if self.syncbatchnorm and not self.is_ddp:
-            import torch.distributed as dist
-            os.environ['MASTER_ADDR'] = 'localhost'
-            os.environ['MASTER_PORT'] = '12355'
-            dist.init_process_group('nccl', rank=0, world_size=1)
+        # if self.syncbatchnorm and not self.is_ddp:
+        #     import torch.distributed as dist
+        #     os.environ['MASTER_ADDR'] = 'localhost'
+        #     os.environ['MASTER_PORT'] = '12355'
+        #     dist.init_process_group('nccl', rank=0, world_size=1)
 
         # instantiate GAN
 
@@ -1010,12 +1018,12 @@ class Trainer():
             **kwargs
         )
 
-        if self.is_ddp:
-            ddp_kwargs = {'device_ids': [self.rank], 'output_device': self.rank, 'find_unused_parameters': True}
+        # if self.is_ddp:
+        #     ddp_kwargs = {'device_ids': [self.rank], 'output_device': self.rank, 'find_unused_parameters': True}
 
-            self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
-            self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
-            self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+        #     self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
+        #     self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
+        #     self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
 
     def write_config(self):
         self.config_path.write_text(json.dumps(self.config()))
@@ -1046,31 +1054,105 @@ class Trainer():
             'freq_chan_attn': self.freq_chan_attn
         }
 
-    def set_data_src(self, folder):
-        num_workers = default(self.num_workers, math.ceil(NUM_CORES / self.world_size))
-        self.dataset = ImageDataset(folder, self.image_size, transparent = self.transparent, greyscale = self.greyscale, aug_prob = self.dataset_aug_prob)
-        sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
-        dataloader = DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+    def set_data_src(self):
+        # start of using HuggingFace dataset
+        dataset = load_dataset("huggan/CelebA-faces")
+
+        if self.transparent:
+            num_channels = 4
+            pillow_mode = 'RGBA'
+            expand_fn = expand_greyscale(self.transparent)
+        elif self.greyscale:
+            num_channels = 1
+            pillow_mode = 'L'
+            expand_fn = identity()
+        else:
+            num_channels = 3
+            pillow_mode = 'RGB'
+            expand_fn = expand_greyscale(self.transparent)
+
+        convert_image_fn = partial(convert_image_to, pillow_mode)
+        
+        transform = transforms.Compose([
+            transforms.Lambda(convert_image_fn),
+            transforms.Lambda(partial(resize_to_minimum_size, self.image_size)),
+            transforms.Resize(self.image_size),
+            RandomApply(0., transforms.RandomResizedCrop(self.image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(self.image_size)),
+            transforms.ToTensor(),
+            transforms.Lambda(expand_fn)
+        ])
+
+        def transform_images(examples):
+            transformed_images = [transform(image.convert("RGB")) for image in examples["image"]]
+
+            examples["image"] = torch.stack(transformed_images)
+  
+            return examples
+
+        transformed_dataset = dataset.with_transform(transform_images)
+        
+        per_device_batch_size = math.ceil(self.batch_size / self.accelerator.num_processes)
+        dataloader = DataLoader(transformed_dataset["train"], per_device_batch_size, sampler = None, shuffle = False, drop_last = True, pin_memory = True)
+        num_samples = len(transformed_dataset)
+        ## end of HuggingFace dataset
+
+        # num_workers = default(self.num_workers, math.ceil(NUM_CORES / self.world_size))
+        # self.dataset = ImageDataset(folder, self.image_size, transparent = self.transparent, greyscale = self.greyscale, aug_prob = self.dataset_aug_prob)
+        # sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
+        # dataloader = DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
         self.loader = cycle(dataloader)
 
         # auto set augmentation prob for user if dataset is detected to be low
-        num_samples = len(self.dataset)
+        # num_samples = len(self.dataset)
         if not exists(self.aug_prob) and num_samples < 1e5:
             self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
 
-    def train(self):
-        assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
-        device = torch.device(f'cuda:{self.rank}')
+    def init_accelerator(self):
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+        
+        if self.accelerator.is_local_main_process:
+            # set up Weights and Biases if requested
+            if self.wandb:
+                import wandb
+
+                wandb.init(project=str(self.results_dir).split("/")[-1]) 
 
         if not exists(self.GAN):
             self.init_GAN()
 
-        self.GAN.train()
-        total_disc_loss = torch.zeros([], device=device)
-        total_gen_loss = torch.zeros([], device=device)
+        G = self.GAN.G
+        D = self.GAN.D
+        D_aug = self.GAN.D_aug
 
-        batch_size = math.ceil(self.batch_size / self.world_size)
+        # amp related contexts and functions
+
+        # amp_context = autocast if self.amp else null_context
+
+        # discriminator loss fn
+
+        self.set_data_src()
+
+        # prepare
+        G, D, D_aug, self.GAN.D_opt, self.GAN.G_opt, self.loader = self.accelerator.prepare(G, D, D_aug, self.GAN.D_opt, self.GAN.G_opt, self.loader)
+
+        return G, D, D_aug
+    
+    def train(self, G, D, D_aug):
+        assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
+        
+        # device = torch.device(f'cuda:{self.rank}')
+
+        # if not exists(self.GAN):
+        #     self.init_GAN()
+
+        self.GAN.train()
+        total_disc_loss = torch.zeros([], device=self.accelerator.device)
+        total_gen_loss = torch.zeros([], device=self.accelerator.device)
+
+        # batch_size = math.ceil(self.batch_size / self.world_size)
+        batch_size = math.ceil(self.batch_size / self.accelerator.num_processes)
 
         image_size = self.GAN.image_size
         latent_dim = self.GAN.latent_dim
@@ -1079,15 +1161,15 @@ class Trainer():
         aug_types  = self.aug_types
         aug_kwargs = {'prob': aug_prob, 'types': aug_types}
 
-        G = self.GAN.G if not self.is_ddp else self.G_ddp
-        D = self.GAN.D if not self.is_ddp else self.D_ddp
-        D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
+        # G = self.GAN.G if not self.is_ddp else self.G_ddp
+        # D = self.GAN.D if not self.is_ddp else self.D_ddp
+        # D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
 
         apply_gradient_penalty = self.steps % 4 == 0
 
         # amp related contexts and functions
 
-        amp_context = autocast if self.amp else null_context
+        # amp_context = autocast if self.amp else null_context
 
         # discriminator loss fn
 
@@ -1100,60 +1182,73 @@ class Trainer():
 
         self.GAN.D_opt.zero_grad()
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, G]):
-            latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
-            image_batch = next(self.loader).cuda(self.rank)
+            # latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
+            # image_batch = next(self.loader).cuda(self.rank)
+            latents = torch.randn(batch_size, latent_dim, device=self.accelerator.device)
+            image_batch = next(self.loader)["image"]
             image_batch.requires_grad_()
 
-            with amp_context():
-                with torch.no_grad():
-                    generated_images = G(latents)
+            # print("Shape of latents:", latents.shape)
+            # print("Shape of image batch:", image_batch.shape)
 
-                fake_output, fake_output_32x32, _ = D_aug(generated_images, detach = True, **aug_kwargs)
+            # with amp_context():
+            with torch.no_grad():
+                generated_images = G(latents)
 
-                real_output, real_output_32x32, real_aux_loss = D_aug(image_batch,  calc_aux_loss = True, **aug_kwargs)
+            fake_output, fake_output_32x32, _ = D_aug(generated_images, detach = True, **aug_kwargs)
 
-                real_output_loss = real_output
-                fake_output_loss = fake_output
+            real_output, real_output_32x32, real_aux_loss = D_aug(image_batch,  calc_aux_loss = True, **aug_kwargs)
 
-                divergence = D_loss_fn(real_output_loss, fake_output_loss)
-                divergence_32x32 = D_loss_fn(real_output_32x32, fake_output_32x32)
-                disc_loss = divergence + divergence_32x32
+            real_output_loss = real_output
+            fake_output_loss = fake_output
 
-                aux_loss = real_aux_loss
-                disc_loss = disc_loss + aux_loss
+            # print("Shape of real output:", real_output.shape)
+            # print("Shape of fake output:", fake_output.shape)
+
+            divergence = D_loss_fn(real_output_loss, fake_output_loss)
+            divergence_32x32 = D_loss_fn(real_output_32x32, fake_output_32x32)
+            disc_loss = divergence + divergence_32x32
+
+            aux_loss = real_aux_loss
+            disc_loss = disc_loss + aux_loss
 
             if apply_gradient_penalty:
                 outputs = [real_output, real_output_32x32]
-                outputs = list(map(self.D_scaler.scale, outputs)) if self.amp else outputs
+                # outputs = list(map(self.D_scaler.scale, outputs)) if self.amp else outputs
+                outputs = outputs
 
                 scaled_gradients = torch_grad(outputs=outputs, inputs=image_batch,
-                                       grad_outputs=list(map(lambda t: torch.ones(t.size(), device = image_batch.device), outputs)),
+                                       # grad_outputs=list(map(lambda t: torch.ones(t.size(), device = image_batch.device), outputs)),
+                                       grad_outputs=list(map(lambda t: torch.ones(t.size(), device = self.accelerator.device), outputs)),
                                        create_graph=True, retain_graph=True, only_inputs=True)[0]
 
-                inv_scale = safe_div(1., self.D_scaler.get_scale()) if self.amp else 1.
+                # inv_scale = safe_div(1., self.D_scaler.get_scale()) if self.amp else 1.
+                inv_scale = 1.
 
                 if inv_scale != float('inf'):
                     gradients = scaled_gradients * inv_scale
 
-                    with amp_context():
-                        gradients = gradients.reshape(batch_size, -1)
-                        gp =  self.gp_weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+                    # with amp_context():
+                    gradients = gradients.reshape(batch_size, -1)
+                    gp =  self.gp_weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
-                        if not torch.isnan(gp):
-                            disc_loss = disc_loss + gp
-                            self.last_gp_loss = gp.clone().detach().item()
+                    if not torch.isnan(gp):
+                        disc_loss = disc_loss + gp
+                        self.last_gp_loss = gp.clone().detach().item()
 
-            with amp_context():
-                disc_loss = disc_loss / self.gradient_accumulate_every
+            # with amp_context():
+            disc_loss = disc_loss / self.gradient_accumulate_every
 
             disc_loss.register_hook(raise_if_nan)
-            self.D_scaler.scale(disc_loss).backward()
+            # self.D_scaler.scale(disc_loss).backward()
+            self.accelerator.backward(disc_loss)
             total_disc_loss += divergence
-
+            
         self.last_recon_loss = aux_loss.item()
         self.d_loss = float(total_disc_loss.item() / self.gradient_accumulate_every)
-        self.D_scaler.step(self.GAN.D_opt)
-        self.D_scaler.update()
+        # self.D_scaler.step(self.GAN.D_opt)
+        # self.D_scaler.update()
+        self.GAN.D_opt.step()
 
         # generator loss fn
 
@@ -1169,32 +1264,36 @@ class Trainer():
         self.GAN.G_opt.zero_grad()
 
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]):
-            latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
+            # latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
+            latents = torch.randn(batch_size, latent_dim, device=self.accelerator.device)
 
             if G_requires_calc_real:
-                image_batch = next(self.loader).cuda(self.rank)
+                # image_batch = next(self.loader).cuda(self.rank)
+                image_batch = next(self.loader)["image"]
                 image_batch.requires_grad_()
 
-            with amp_context():
-                generated_images = G(latents)
+            # with amp_context():
+            generated_images = G(latents)
 
-                fake_output, fake_output_32x32, _ = D_aug(generated_images, **aug_kwargs)
-                real_output, real_output_32x32, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None, None)
+            fake_output, fake_output_32x32, _ = D_aug(generated_images, **aug_kwargs)
+            real_output, real_output_32x32, _ = D_aug(image_batch, **aug_kwargs) if G_requires_calc_real else (None, None, None)
 
-                loss = G_loss_fn(fake_output, real_output)
-                loss_32x32 = G_loss_fn(fake_output_32x32, real_output_32x32)
+            loss = G_loss_fn(fake_output, real_output)
+            loss_32x32 = G_loss_fn(fake_output_32x32, real_output_32x32)
 
-                gen_loss = loss + loss_32x32
+            gen_loss = loss + loss_32x32
 
-                gen_loss = gen_loss / self.gradient_accumulate_every
+            gen_loss = gen_loss / self.gradient_accumulate_every
 
             gen_loss.register_hook(raise_if_nan)
-            self.G_scaler.scale(gen_loss).backward()
+            # self.G_scaler.scale(gen_loss).backward()
+            self.accelerator.backward(gen_loss)
             total_gen_loss += loss 
 
         self.g_loss = float(total_gen_loss.item() / self.gradient_accumulate_every)
-        self.G_scaler.step(self.GAN.G_opt)
-        self.G_scaler.update()
+        # self.G_scaler.step(self.GAN.G_opt)
+        # self.G_scaler.update()
+        self.GAN.G_opt.step()
 
         # calculate moving averages
 
@@ -1216,7 +1315,8 @@ class Trainer():
 
         # periodically save results
 
-        if self.is_main:
+        # if self.is_main:
+        if self.accelerator.is_main_process:
             if self.steps % self.save_every == 0:
                 self.save(self.checkpoint_num)
 
@@ -1245,7 +1345,8 @@ class Trainer():
 
         # latents and noise
 
-        latents = torch.randn((num_rows ** 2, latent_dim)).cuda(self.rank)
+        # latents = torch.randn((num_rows ** 2, latent_dim)).cuda(self.rank)
+        latents = torch.randn(num_rows ** 2, latent_dim, device=self.accelerator.device)
 
         # regular
 
@@ -1254,7 +1355,7 @@ class Trainer():
         
         # moving averages
 
-        generated_images = self.generate_(self.GAN.GE, latents)
+        generated_images = self.generate_(self.GAN.GE.to(self.accelerator.device), latents)
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
 
     @torch.no_grad()
@@ -1272,7 +1373,8 @@ class Trainer():
         # regular
         if 'default' in types:
             for i in tqdm(range(num_image_tiles), desc='Saving generated default images'):
-                latents = torch.randn((1, latent_dim)).cuda(self.rank)
+                # latents = torch.randn((1, latent_dim)).cuda(self.rank)
+                latents = torch.randn(1, latent_dim, device=self.accelerator.device)
                 generated_image = self.generate_(self.GAN.G, latents)
                 path = str(self.results_dir / dir_name / f'{str(num)}-{str(i)}.{ext}')
                 torchvision.utils.save_image(generated_image[0], path, nrow=1)
@@ -1280,7 +1382,8 @@ class Trainer():
         # moving averages
         if 'ema' in types:
             for i in tqdm(range(num_image_tiles), desc='Saving generated EMA images'):
-                latents = torch.randn((1, latent_dim)).cuda(self.rank)
+                # latents = torch.randn((1, latent_dim)).cuda(self.rank)
+                latents = torch.randn(1, latent_dim, device=self.accelerator.device)
                 generated_image = self.generate_(self.GAN.GE, latents)
                 path = str(self.results_dir / dir_name / f'{str(num)}-{str(i)}-ema.{ext}')
                 torchvision.utils.save_image(generated_image[0], path, nrow=1)
@@ -1307,7 +1410,8 @@ class Trainer():
             self.GAN.eval()
 
             if checkpoint == 0:
-                latents = torch.randn((num_images, self.GAN.latent_dim)).cuda(self.rank)
+                # latents = torch.randn((num_images, self.GAN.latent_dim)).cuda(self.rank)
+                latents = torch.randn(num_images, self.GAN.latent_dim, self.accelerator.device)
 
             # regular
             if 'default' in types:
@@ -1324,7 +1428,7 @@ class Trainer():
     @torch.no_grad()
     def calculate_fid(self, num_batches):
         from pytorch_fid import fid_score
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         real_path = self.fid_dir / 'real'
         fake_path = self.fid_dir / 'fake'
@@ -1335,7 +1439,7 @@ class Trainer():
             os.makedirs(real_path)
 
             for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-                real_batch = next(self.loader)
+                real_batch = next(self.loader)["image"]
                 for k, image in enumerate(real_batch.unbind(0)):
                     ind = k + batch_num * self.batch_size
                     torchvision.utils.save_image(image, real_path / f'{ind}.png')
@@ -1353,7 +1457,8 @@ class Trainer():
 
         for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
             # latents and noise
-            latents = torch.randn(self.batch_size, latent_dim).cuda(self.rank)
+            # latents = torch.randn(self.batch_size, latent_dim).cuda(self.rank)
+            latents = torch.randn(self.batch_size, latent_dim, device=self.accelerator.device)
 
             # moving averages
             generated_images = self.generate_(self.GAN.GE, latents)
@@ -1380,8 +1485,10 @@ class Trainer():
 
         # latents and noise
 
-        latents_low = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
-        latents_high = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
+        # latents_low = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
+        # latents_high = torch.randn(num_rows ** 2, latent_dim).cuda(self.rank)
+        latents_low = torch.randn(num_rows ** 2, latent_dim, device=self.accelerator.device)
+        latents_high = torch.randn(num_rows ** 2, latent_dim, device=self.accelerator.device)
 
         ratios = torch.linspace(0., 8., num_steps)
 
@@ -1419,6 +1526,13 @@ class Trainer():
         log = ' | '.join(map(lambda n: f'{n[0]}: {n[1]:.2f}', data))
         print(log)
 
+        if self.accelerator.is_local_main_process:
+            log_dict = {v[0]: v[1] for v in data}
+            if self.wandb:
+                import wandb
+
+                wandb.log(log_dict)
+
     def model_name(self, num):
         return str(self.models_dir / self.name / f'model_{num}.pt')
 
@@ -1436,9 +1550,9 @@ class Trainer():
     def save(self, num):
         save_data = {
             'GAN': self.GAN.state_dict(),
-            'version': __version__,
-            'G_scaler': self.G_scaler.state_dict(),
-            'D_scaler': self.D_scaler.state_dict()
+            #'version': __version__,
+            #'G_scaler': self.G_scaler.state_dict(),
+            #'D_scaler': self.D_scaler.state_dict()
         }
 
         torch.save(save_data, self.model_name(num))

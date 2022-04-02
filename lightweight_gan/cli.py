@@ -6,7 +6,7 @@ from tqdm import tqdm
 from datetime import datetime
 from functools import wraps
 from lightweight_gan import Trainer, NanException
-from lightweight_gan.diff_augment_test import DiffAugmentTest
+# from lightweight_gan.diff_augment_test import DiffAugmentTest
 
 import torch
 import torch.multiprocessing as mp
@@ -36,22 +36,22 @@ def set_seed(seed):
     random.seed(seed)
 
 def run_training(rank, world_size, model_args, data, load_from, new, num_train_steps, name, seed):
-    is_main = rank == 0
-    is_ddp = world_size > 1
+    # is_main = rank == 0
+    # is_ddp = world_size > 1
 
-    if is_ddp:
-        set_seed(seed)
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        dist.init_process_group('nccl', rank=rank, world_size=world_size)
+    # if is_ddp:
+    #     set_seed(seed)
+    #     os.environ['MASTER_ADDR'] = 'localhost'
+    #     os.environ['MASTER_PORT'] = '12355'
+    #     dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
-        print(f"{rank + 1}/{world_size} process initialized.")
+    #     print(f"{rank + 1}/{world_size} process initialized.")
 
-    model_args.update(
-        is_ddp = is_ddp,
-        rank = rank,
-        world_size = world_size
-    )
+    # model_args.update(
+    #     is_ddp = is_ddp,
+    #     rank = rank,
+    #     world_size = world_size
+    # )
 
     model = Trainer(**model_args)
 
@@ -60,20 +60,23 @@ def run_training(rank, world_size, model_args, data, load_from, new, num_train_s
     else:
         model.clear()
 
-    model.set_data_src(data)
-
     progress_bar = tqdm(initial = model.steps, total = num_train_steps, mininterval=10., desc=f'{name}<{data}>')
+    G, D, D_aug = model.init_accelerator()
+
+    # model.set_data_src(data)
+
     while model.steps < num_train_steps:
-        retry_call(model.train, tries=3, exceptions=NanException)
+        # retry_call(model.train, tries=3, exceptions=NanException)
+        model.train(G, D, D_aug)
         progress_bar.n = model.steps
         progress_bar.refresh()
-        if is_main and model.steps % 50 == 0:
+        if model.accelerator.is_local_main_process and model.steps % 50 == 0:
             model.print_log()
 
     model.save(model.checkpoint_num)
 
-    if is_ddp:
-        dist.destroy_process_group()
+    # if is_ddp:
+    #     dist.destroy_process_group()
 
 def train_from_folder(
     data = './data',
@@ -116,6 +119,7 @@ def train_from_folder(
     seed = 42,
     amp = False,
     show_progress = False,
+    wandb = False,
 ):
     num_image_tiles = default(num_image_tiles, 4 if image_size > 512 else 8)
 
@@ -146,7 +150,8 @@ def train_from_folder(
         calculate_fid_every = calculate_fid_every,
         calculate_fid_num_images = calculate_fid_num_images,
         clear_fid_cache = clear_fid_cache,
-        amp = amp
+        amp = amp,
+        wandb = wandb,
     )
 
     if generate:
@@ -188,3 +193,6 @@ def train_from_folder(
 
 def main():
     fire.Fire(train_from_folder)
+
+if __name__ == "__main__":
+    main()
