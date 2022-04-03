@@ -1181,7 +1181,7 @@ class Trainer():
         # train discriminator
 
         self.GAN.D_opt.zero_grad()
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, G]):
+        for i in range(self.gradient_accumulate_every):
             # latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
             # image_batch = next(self.loader).cuda(self.rank)
             latents = torch.randn(batch_size, latent_dim, device=self.accelerator.device)
@@ -1237,6 +1237,8 @@ class Trainer():
                         self.last_gp_loss = gp.clone().detach().item()
 
             # with amp_context():
+            # divide loss by gradient accumulation steps since gradients
+            # are accumulated for multiple backward passes in PyTorch
             disc_loss = disc_loss / self.gradient_accumulate_every
 
             disc_loss.register_hook(raise_if_nan)
@@ -1263,7 +1265,7 @@ class Trainer():
 
         self.GAN.G_opt.zero_grad()
 
-        for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[G, D_aug]):
+        for i in range(self.gradient_accumulate_every):
             # latents = torch.randn(batch_size, latent_dim).cuda(self.rank)
             latents = torch.randn(batch_size, latent_dim, device=self.accelerator.device)
 
@@ -1290,6 +1292,8 @@ class Trainer():
             self.accelerator.backward(gen_loss)
             total_gen_loss += loss 
 
+        # divide loss by gradient accumulation steps since gradients
+        # are accumulated for multiple backward passes in PyTorch
         self.g_loss = float(total_gen_loss.item() / self.gradient_accumulate_every)
         # self.G_scaler.step(self.GAN.G_opt)
         # self.G_scaler.update()
