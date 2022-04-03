@@ -22,6 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from PIL import Image
 import torchvision
 from torchvision import transforms
+from torchvision.utils import save_image
 from kornia.filters import filter2d
 
 from diff_augment import DiffAugment
@@ -42,7 +43,7 @@ assert torch.cuda.is_available(), 'You need to have an Nvidia GPU with CUDA inst
 
 # constants
 
-NUM_CORES = multiprocessing.cpu_count()
+# NUM_CORES = multiprocessing.cpu_count()
 EXTS = ['jpg', 'jpeg', 'png']
 
 # helpers
@@ -54,12 +55,12 @@ def exists(val):
 def null_context():
     yield
 
-def combine_contexts(contexts):
-    @contextmanager
-    def multi_contexts():
-        with ExitStack() as stack:
-            yield [stack.enter_context(ctx()) for ctx in contexts]
-    return multi_contexts
+# def combine_contexts(contexts):
+#     @contextmanager
+#     def multi_contexts():
+#         with ExitStack() as stack:
+#             yield [stack.enter_context(ctx()) for ctx in contexts]
+#     return multi_contexts
 
 def is_power_of_two(val):
     return log2(val).is_integer()
@@ -80,18 +81,18 @@ def raise_if_nan(t):
     if torch.isnan(t):
         raise NanException
 
-def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
-    if is_ddp:
-        num_no_syncs = gradient_accumulate_every - 1
-        head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
-        tail = [null_context]
-        contexts =  head + tail
-    else:
-        contexts = [null_context] * gradient_accumulate_every
+# def gradient_accumulate_contexts(gradient_accumulate_every, is_ddp, ddps):
+#     if is_ddp:
+#         num_no_syncs = gradient_accumulate_every - 1
+#         head = [combine_contexts(map(lambda ddp: ddp.no_sync, ddps))] * num_no_syncs
+#         tail = [null_context]
+#         contexts =  head + tail
+#     else:
+#         contexts = [null_context] * gradient_accumulate_every
 
-    for context in contexts:
-        with context():
-            yield
+#     for context in contexts:
+#         with context():
+#             yield
 
 def evaluate_in_chunks(max_batch_size, model, *args):
     split_args = list(zip(*list(map(lambda x: x.split(max_batch_size, dim=0), args))))
@@ -965,12 +966,12 @@ class Trainer():
         self.rank = rank
         self.world_size = world_size
 
-        # self.syncbatchnorm = is_ddp
-        self.syncbatchnorm = False
+        # TODO make this more general
+        self.syncbatchnorm = True
 
-        self.amp = amp
-        self.G_scaler = GradScaler(enabled = self.amp)
-        self.D_scaler = GradScaler(enabled = self.amp)
+        # self.amp = amp
+        # self.G_scaler = GradScaler(enabled = self.amp)
+        # self.D_scaler = GradScaler(enabled = self.amp)
 
         self.wandb = wandb
 
@@ -1139,7 +1140,7 @@ class Trainer():
 
         # prepare
         G, D, D_aug, self.GAN.D_opt, self.GAN.G_opt, self.loader = self.accelerator.prepare(G, D, D_aug, self.GAN.D_opt, self.GAN.G_opt, self.loader)
-
+        
         return G, D, D_aug
     
     def train(self, G, D, D_aug):
@@ -1304,10 +1305,12 @@ class Trainer():
 
         # calculate moving averages
 
-        if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
+        # if self.is_main and self.steps % 10 == 0 and self.steps > 20000:
+        if self.accelerator.is_main_process and self.steps % 10 == 0 and self.steps > 20000:
             self.GAN.EMA()
 
-        if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
+        #if self.is_main and self.steps <= 25000 and self.steps % 1000 == 2:
+        if self.accelerator.is_main_process and self.steps <= 25000 and self.steps % 1000 == 2:
             self.GAN.reset_parameter_averaging()
 
         # save from NaN errors
@@ -1358,12 +1361,20 @@ class Trainer():
         # regular
 
         generated_images = self.generate_(self.GAN.G, latents)
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
+        file_name = str(self.results_dir / self.name / f'{str(num)}.{ext}')
+        save_image(generated_images, file_name, nrow=num_rows)
         
         # moving averages
 
         generated_images = self.generate_(self.GAN.GE.to(self.accelerator.device), latents)
-        torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
+        file_name_ema =  str(self.results_dir / self.name / f'{str(num)}-ema.{ext}')
+        save_image(generated_images, file_name_ema, nrow=num_rows)
+
+        if self.accelerator.is_local_main_process and self.wandb:
+            import wandb
+
+            wandb.log({'generated_examples': wandb.Image(str(file_name)) })
+            wandb.log({'generated_examples_ema': wandb.Image(str(file_name_ema)) })
 
     @torch.no_grad()
     def generate(self, num=0, num_image_tiles=4, checkpoint=None, types=['default', 'ema']):
@@ -1384,7 +1395,7 @@ class Trainer():
                 latents = torch.randn(1, latent_dim, device=self.accelerator.device)
                 generated_image = self.generate_(self.GAN.G, latents)
                 path = str(self.results_dir / dir_name / f'{str(num)}-{str(i)}.{ext}')
-                torchvision.utils.save_image(generated_image[0], path, nrow=1)
+                save_image(generated_image[0], path, nrow=1)
 
         # moving averages
         if 'ema' in types:
@@ -1393,7 +1404,7 @@ class Trainer():
                 latents = torch.randn(1, latent_dim, device=self.accelerator.device)
                 generated_image = self.generate_(self.GAN.GE, latents)
                 path = str(self.results_dir / dir_name / f'{str(num)}-{str(i)}-ema.{ext}')
-                torchvision.utils.save_image(generated_image[0], path, nrow=1)
+                save_image(generated_image[0], path, nrow=1)
 
         return dir_full
 
@@ -1424,13 +1435,13 @@ class Trainer():
             if 'default' in types:
                 generated_image = self.generate_(self.GAN.G, latents)
                 path = str(self.results_dir / dir_name / f'{str(checkpoint).zfill(zfill_length)}.{ext}')
-                torchvision.utils.save_image(generated_image, path, nrow=num_images)
+                save_image(generated_image, path, nrow=num_images)
 
             # moving averages
             if 'ema' in types:
                 generated_image = self.generate_(self.GAN.GE, latents)
                 path = str(self.results_dir / dir_name / f'{str(checkpoint).zfill(zfill_length)}-ema.{ext}')
-                torchvision.utils.save_image(generated_image, path, nrow=num_images)
+                save_image(generated_image, path, nrow=num_images)
 
     @torch.no_grad()
     def calculate_fid(self, num_batches):
@@ -1449,7 +1460,7 @@ class Trainer():
                 real_batch = next(self.loader)["image"]
                 for k, image in enumerate(real_batch.unbind(0)):
                     ind = k + batch_num * self.batch_size
-                    torchvision.utils.save_image(image, real_path / f'{ind}.png')
+                    save_image(image, real_path / f'{ind}.png')
 
         # generate a bunch of fake images in results / name / fid_fake
 
@@ -1472,7 +1483,7 @@ class Trainer():
 
             for j, image in enumerate(generated_images.unbind(0)):
                 ind = j + batch_num * self.batch_size
-                torchvision.utils.save_image(image, str(fake_path / f'{str(ind)}-ema.{ext}'))
+                save_image(image, str(fake_path / f'{str(ind)}-ema.{ext}'))
 
         return fid_score.calculate_fid_given_paths([str(real_path), str(fake_path)], 256, latents.device, 2048)
 
@@ -1591,10 +1602,10 @@ class Trainer():
             print('unable to load save model. please try downgrading the package to the version specified by the saved model')
             raise e
 
-        if 'G_scaler' in load_data:
-            self.G_scaler.load_state_dict(load_data['G_scaler'])
-        if 'D_scaler' in load_data:
-            self.D_scaler.load_state_dict(load_data['D_scaler'])
+        # if 'G_scaler' in load_data:
+        #     self.G_scaler.load_state_dict(load_data['G_scaler'])
+        # if 'D_scaler' in load_data:
+        #     self.D_scaler.load_state_dict(load_data['D_scaler'])
 
     def get_checkpoints(self):
         file_paths = [p for p in Path(self.models_dir / self.name).glob('model_*.pt')]

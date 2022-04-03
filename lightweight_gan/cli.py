@@ -6,7 +6,7 @@ from tqdm import tqdm
 from datetime import datetime
 from functools import wraps
 from lightweight_gan import Trainer, NanException
-# from lightweight_gan.diff_augment_test import DiffAugmentTest
+from diff_augment_test import DiffAugmentTest
 
 import torch
 import torch.multiprocessing as mp
@@ -35,7 +35,7 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-def run_training(rank, world_size, model_args, data, load_from, new, num_train_steps, name, seed):
+def run_training(model_args, data, load_from, new, num_train_steps, name, seed):
     # is_main = rank == 0
     # is_ddp = world_size > 1
 
@@ -182,12 +182,14 @@ def train_from_folder(
         DiffAugmentTest(data=data, image_size=image_size, batch_size=batch_size, types=aug_types, nrow=num_image_tiles)
         return
 
+    run_training(model_args, data, load_from, new, num_train_steps, name, seed)
+
     world_size = torch.cuda.device_count()
 
     if world_size == 1 or not multi_gpus:
-        run_training(0, 1, model_args, data, load_from, new, num_train_steps, name, seed)
+        run_training(model_args, data, load_from, new, num_train_steps, name, seed)
         return
-
+    
     mp.spawn(run_training,
         args=(world_size, model_args, data, load_from, new, num_train_steps, name, seed),
         nprocs=world_size,
