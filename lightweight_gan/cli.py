@@ -79,6 +79,7 @@ def run_training(rank, world_size, model_args, data, load_from, new, num_train_s
     #     dist.destroy_process_group()
 
 def train_from_folder(
+    dataset_name = 'huggan/CelebA-faces',
     data = './data',
     results_dir = './results',
     models_dir = './models',
@@ -124,6 +125,7 @@ def train_from_folder(
     num_image_tiles = default(num_image_tiles, 4 if image_size > 512 else 8)
 
     model_args = dict(
+        dataset_name = dataset_name,
         name = name,
         results_dir = results_dir,
         models_dir = models_dir,

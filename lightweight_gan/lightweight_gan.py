@@ -850,6 +850,7 @@ class LightweightGAN(nn.Module):
 class Trainer():
     def __init__(
         self,
+        dataset_name = "huggan/CelebA-faces",
         name = 'default',
         results_dir = 'results',
         models_dir = 'models',
@@ -893,6 +894,8 @@ class Trainer():
         self.GAN_params = [args, kwargs]
         self.GAN = None
 
+        self.dataset_name = dataset_name
+        
         self.name = name
 
         base_dir = Path(base_dir)
@@ -1056,7 +1059,7 @@ class Trainer():
 
     def set_data_src(self):
         # start of using HuggingFace dataset
-        dataset = load_dataset("huggan/CelebA-faces")
+        dataset = load_dataset(self.dataset_name)
 
         if self.transparent:
             num_channels = 4
